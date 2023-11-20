@@ -1,10 +1,11 @@
 package tools
 
 import (
+	"bytes"
 	"compress/gzip"
 	"fmt"
+	"hash/crc32"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"net/http/httputil"
@@ -17,6 +18,7 @@ import (
 
 var originalUrlResolver = make(map[string]*url.URL)
 var mutex = &sync.Mutex{}
+var cachePath = getEnv("CACHE_PATH", "./cache")
 
 // ProxyRequestHandler intercepts requests to CodeArtifact and add the Authorization header + correct Host header
 func ProxyRequestHandler(p *httputil.ReverseProxy) func(http.ResponseWriter, *http.Request) {
@@ -40,7 +42,20 @@ func ProxyRequestHandler(p *httputil.ReverseProxy) func(http.ResponseWriter, *ht
 		// Set the Authorization header with the CodeArtifact Authorization Token
 		r.SetBasicAuth("aws", CodeArtifactAuthInfo.AuthorizationToken)
 
-		log.Printf("REQ: %s %s \"%s\" \"%s\"", r.RemoteAddr, r.Method, r.URL.RequestURI(), r.UserAgent())
+		hash := HashStrings([]string{r.URL.RequestURI()})
+
+		// Check if the request is for a tarball, if so, check if we have a cached version
+		if strings.HasSuffix(r.URL.RequestURI(), ".tgz") {
+			// Check if the file exists in the cache
+			if _, err := os.Stat(fmt.Sprintf("%s/%s", cachePath, hash)); err == nil {
+				log.Printf("Serving cached version of %s", r.URL.RequestURI())
+				http.ServeFile(w, r, fmt.Sprintf("%s/%s", cachePath, hash))
+				mutex.Unlock()
+				return
+			}
+		}
+
+		log.Printf("REQ Method: %s; URI: %s; hash: %s", r.Method, r.URL.RequestURI(), hash)
 
 		log.Printf("Sending request to %s%s", strings.Trim(CodeArtifactAuthInfo.Url, "/"), r.URL.RequestURI())
 		mutex.Unlock()
@@ -69,14 +84,37 @@ func ProxyResponseHandler() func(*http.Response) error {
 		if r.StatusCode == 301 || r.StatusCode == 302 {
 			location, _ := r.Location()
 
+			hash := HashStrings([]string{r.Request.RequestURI})
+
+			//log.Printf("RequestURI: %s; Hash: %s; Location: %s\n", r.Request.RequestURI, hash, location)
+			// Download the file and cache it
+			if strings.HasSuffix(r.Request.RequestURI, ".tgz") {
+				log.Printf("Caching %s", r.Request.RequestURI)
+				// Download the file and cache it
+				resp, err := http.Get(location.String())
+				if err != nil {
+					log.Printf("Error downloading file: %s", err)
+				}
+
+				defer resp.Body.Close()
+
+				body, err := io.ReadAll(resp.Body)
+				if err != nil {
+					log.Printf("Error reading response body: %s", err)
+				}
+
+				err = os.WriteFile(fmt.Sprintf("%s/%s", cachePath, hash), body, 0644)
+				if err != nil {
+					log.Printf("Error writing file to cache: %s", err)
+				}
+			}
+
 			// Only attempt to rewrite the location if the host matches the CodeArtifact host
 			// Otherwise leave the original location intact (e.g a redirect to a S3 presigned URL)
 			if location.Host == u.Host {
 				location.Host = originalUrl.Host
 				location.Scheme = originalUrl.Scheme
 				location.Path = strings.Replace(location.Path, u.Path, "", 1)
-
-				r.Header.Set("Location", location.String())
 			}
 		}
 
@@ -102,7 +140,7 @@ func ProxyResponseHandler() func(*http.Response) error {
 			}
 
 			// replace any instances of the CodeArtifact URL with the local URL
-			oldContentResponse, _ := ioutil.ReadAll(body)
+			oldContentResponse, _ := io.ReadAll(body)
 			oldContentResponseStr := string(oldContentResponse)
 
 			mutex.Lock()
@@ -113,7 +151,7 @@ func ProxyResponseHandler() func(*http.Response) error {
 			newResponseContent = strings.Replace(newResponseContent, CodeArtifactAuthInfo.Url, newUrl, -1)
 			mutex.Unlock()
 
-			r.Body = ioutil.NopCloser(strings.NewReader(newResponseContent))
+			r.Body = io.NopCloser(strings.NewReader(newResponseContent))
 			r.ContentLength = int64(len(newResponseContent))
 			r.Header.Set("Content-Length", strconv.Itoa(len(newResponseContent)))
 		}
@@ -121,6 +159,15 @@ func ProxyResponseHandler() func(*http.Response) error {
 		return nil
 	}
 
+}
+
+func EmptyHandler(w http.ResponseWriter, r *http.Request) {
+	//log.Printf("REQ: %s %s \"%s\" \"%s\"", r.RemoteAddr, r.Method, r.URL.RequestURI(), r.UserAgent())
+	//log.Printf("RES: %s \"%s\" %d \"%s\" \"%s\"", r.RemoteAddr, r.Method, 200, r.URL.RequestURI(), r.UserAgent())
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	w.Write([]byte(`{"actions": []}`))
 }
 
 // ProxyInit initialises the CodeArtifact proxy and starts the HTTP listener
@@ -138,6 +185,9 @@ func ProxyInit() {
 	proxy.ModifyResponse = ProxyResponseHandler()
 
 	http.HandleFunc("/", ProxyRequestHandler(proxy))
+	http.HandleFunc("/-/npm/v1/security/audits/quick", EmptyHandler)
+	http.HandleFunc("/-/npm/v1/security/advisories/bulk", EmptyHandler)
+
 	err = http.ListenAndServe(":"+port, nil)
 	if err != nil {
 		panic(err)
@@ -149,4 +199,32 @@ func getEnv(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// String hashes a string to a unique hashcode.
+//
+// crc32 returns a uint32, but for our use we need
+// and non negative integer. Here we cast to an integer
+// and invert it if the result is negative.
+func HashString(s string) int {
+	v := int(crc32.ChecksumIEEE([]byte(s)))
+	if v >= 0 {
+		return v
+	}
+	if -v >= 0 {
+		return -v
+	}
+	// v == MinInt
+	return 0
+}
+
+// Strings hashes a list of strings to a unique hashcode.
+func HashStrings(strings []string) string {
+	var buf bytes.Buffer
+
+	for _, s := range strings {
+		buf.WriteString(fmt.Sprintf("%s-", s))
+	}
+
+	return fmt.Sprintf("%d", HashString(buf.String()))
 }

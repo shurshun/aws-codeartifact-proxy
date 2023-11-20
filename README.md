@@ -42,6 +42,7 @@ Configuration is done via Environment Variables:
 | `CODEARTIFACT_TYPE`   | No         | Use one of the following: pypi, npm, maven |
 | `CODEARTIFACT_OWNER`  | No         | The AWS Account ID of the CodeArtifact Owner (if it's your own account, it can be empty) |
 | `LISTEN_PORT`         | No         | Port on which the proxy should listen.  Defaults to 8080 |
+| `CACHE_PATH`          | No         | Path to the cache directory.  Defaults to `./cache` |
 
 By default, the proxy will choose to use the Pypi as its type.
 
@@ -72,12 +73,14 @@ services:
     restart: always
     volumes:
       - /home/sktan/.aws/:/.aws
+      - ./cache:/cache
     environment:
       AWS_PROFILE: sktansandbox
       CODEARTIFACT_DOMAIN: sktansandbox
       CODEARTIFACT_REPO: sandbox
       CODEARTIFACT_OWNER: 1234567890
       CODEARTIFACT_TYPE: pypi
+      CACHE_PATH: /cache
     ports:
       - 8080:8080
 ```
