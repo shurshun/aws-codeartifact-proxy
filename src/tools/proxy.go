@@ -123,7 +123,8 @@ func ProxyResponseHandler() func(*http.Response) error {
 		if strings.HasPrefix(r.Request.UserAgent(), "npm") ||
 			strings.HasPrefix(r.Request.UserAgent(), "pnpm") ||
 			strings.HasPrefix(r.Request.UserAgent(), "yarn") ||
-			strings.HasPrefix(r.Request.UserAgent(), "Bun") {
+			strings.HasPrefix(r.Request.UserAgent(), "Bun") ||
+			strings.HasPrefix(r.Request.UserAgent(), "got") {
 
 			// Respond to only requests that respond with JSON
 			// There might eventually be additional headers i don't know about?
